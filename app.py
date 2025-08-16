@@ -5,7 +5,7 @@ import random
 import numpy as np
 import gradio as gr
 import re
-from chatterbox.tts import ChatterboxTTS
+from chatterbox.tts import ChatterboxTTS, Conditionals
 
 torch.set_float32_matmul_precision('high')
 
@@ -14,9 +14,9 @@ print(f"🚀 Running on device: {DEVICE}")
 
 MODEL = None
 
-PRIMARY_AVATARS = os.path.join("chatterbox", "data", "avatars")
-FALLBACK_AVATARS = os.path.join("/", "content", "drive", "MyDrive", "Projects", "chatterbox", "src", "chatterbox", "avatars")
-AVATAR_PATH = PRIMARY_AVATARS if os.path.isdir(PRIMARY_AVATARS) else FALLBACK_AVATARS
+PRIMARY_AVATARS = os.path.join("src", "chatterbox", "data", "avatars")
+VOICES_PATH = os.path.join("src", "chatterbox", "data", "voices")
+os.makedirs(VOICES_PATH, exist_ok=True)
 AVATAR = "Tobin"
 
 
@@ -31,12 +31,29 @@ def load_model():
     return MODEL
 
 
-def list_avatars(avatar_dir=AVATAR_PATH, preferred=AVATAR):
-    files = [
-        f for f in os.listdir(avatar_dir)
-        if os.path.isfile(os.path.join(avatar_dir, f)) and f.lower().endswith(('.wav', '.flac', '.mp3'))
-    ]
-    avatar_map = {os.path.splitext(f)[0].capitalize(): os.path.join(avatar_dir, f) for f in files}
+def list_avatars(preferred=AVATAR):
+    # Scan for .wav, .flac, .mp3 files in PRIMARY_AVATARS
+    avatar_files = []
+    if os.path.isdir(PRIMARY_AVATARS):
+        avatar_files = [
+            f for f in os.listdir(PRIMARY_AVATARS)
+            if os.path.isfile(os.path.join(PRIMARY_AVATARS, f)) and f.lower().endswith(('.wav', '.flac', '.mp3'))
+        ]
+
+    # Scan for .pt files in VOICES_PATH
+    voice_files = []
+    if os.path.isdir(VOICES_PATH):
+        voice_files = [
+            f for f in os.listdir(VOICES_PATH)
+            if os.path.isfile(os.path.join(VOICES_PATH, f)) and f.lower().endswith('.pt')
+        ]
+
+    # Create a map from avatar name to file path
+    avatar_map = {os.path.splitext(f)[0].capitalize(): os.path.join(PRIMARY_AVATARS, f) for f in avatar_files}
+    voice_map = {os.path.splitext(f)[0].capitalize(): os.path.join(VOICES_PATH, f) for f in voice_files}
+    avatar_map.update(voice_map)
+
+    # Sort options and set a default
     options = sorted(avatar_map.keys(), key=lambda x: x.lower())
     default = preferred if preferred in avatar_map else (options[0] if options else None)
     return avatar_map, options, default
@@ -85,6 +102,13 @@ def add_silence_padding(audio, silence_duration=0.5, sample_rate=24000):
 
 def generate_long_audio(model, text, audio_prompt_path, max_chunk_length=750, silence_duration=0.5,
                         exaggeration=0.5, temperature=0.8, cfg_weight=0.5):
+
+    if audio_prompt_path:
+        if audio_prompt_path.endswith('.pt'):
+            model.conds = Conditionals.load(audio_prompt_path, map_location=DEVICE).to(DEVICE)
+        else:
+            model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+
     chunks = split_text_into_chunks(text, max_chunk_length)
     if not chunks:
         return None
@@ -99,14 +123,14 @@ def generate_long_audio(model, text, audio_prompt_path, max_chunk_length=750, si
         try:
             chunk_audio = model.generate(
                 chunk,
-                audio_prompt_path=audio_prompt_path,
+                audio_prompt_path=None,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 exaggeration=exaggeration
             )
             if i < total_chunks - 1:
                 chunk_audio = add_silence_padding(chunk_audio, silence_duration, model.sr)
-            audio_segments.append(chunk_audio)
+            audio_segments.append(chunk_audio.cpu())
         except Exception as e:
             print(f"Error generating chunk {i+1}: {e}")
             continue
@@ -160,6 +184,26 @@ def generate_audio(
     return current_model.sr, wav_np
 
 
+def prepare_voice(voice_name, audio_file):
+    if not voice_name or not audio_file:
+        return "Please provide a voice name and an audio file.", gr.update()
+
+    model = load_model()
+    voice_name = "".join(c for c in voice_name if c.isalnum() or c in (' ', '_')).rstrip()
+    output_path = os.path.join(VOICES_PATH, f"{voice_name}.pt")
+
+    try:
+        model.prepare_conditionals(audio_file.name)
+        model.conds.save(output_path)
+
+        # Refresh the avatar list
+        global avatar_map, avatar_list, default_avatar
+        avatar_map, avatar_list, default_avatar = list_avatars()
+        return f"Voice '{voice_name}' prepared and saved successfully.", gr.update(choices=avatar_list)
+    except Exception as e:
+        return f"Error preparing voice: {e}", gr.update()
+
+
 avatar_map, avatar_list, default_avatar = list_avatars()
 
 with gr.Blocks(
@@ -174,55 +218,66 @@ with gr.Blocks(
 ) as demo:
 
     gr.Markdown("""
-    ## Chatterbox TTS  
+    ## Chatterbox TTS
     **A streamlined, high-quality text-to-speech tool built for clarity, expressiveness, and control.**
     """)
 
-    with gr.Row():
-        with gr.Column():
-            text = gr.Textbox(
-                label="📝 Text to Synthesize",
-                placeholder="Enter text to synthesize...",
-                lines=8,
-                max_lines=14,
-            )
+    with gr.Tabs():
+        with gr.TabItem("Generate Speech"):
+            with gr.Row():
+                with gr.Column():
+                    text = gr.Textbox(
+                        label="📝 Text to Synthesize",
+                        placeholder="Enter text to synthesize...",
+                        lines=8,
+                        max_lines=14,
+                    )
 
-            ref_avatar = gr.Dropdown(
-                choices=avatar_list,
-                label="🎭 Voice Avatar",
-                value=default_avatar,
-                info="Select the voice character"
-            )
+                    ref_avatar = gr.Dropdown(
+                        choices=avatar_list,
+                        label="🎭 Voice Avatar",
+                        value=default_avatar,
+                        info="Select the voice character"
+                    )
 
-            with gr.Accordion("⚙️ Advanced Options", open=False):
-                exaggeration = gr.Slider(0.25, 2, step=0.05, label="Exaggeration", value=0.5)
-                cfg_weight = gr.Slider(0.2, 1, step=0.05, label="CFG / Pace", value=0.5)
-                temp = gr.Slider(0.05, 5, step=0.05, label="Temperature", value=0.8)
-                chunk_len = gr.Slider(500, 800, step=50, label="Chunk Length", value=750)
-                seed_num = gr.Number(value=0, label="Seed (0 = random)")
+                    with gr.Accordion("⚙️ Advanced Options", open=False):
+                        exaggeration = gr.Slider(0.25, 2, step=0.05, label="Exaggeration", value=0.5)
+                        cfg_weight = gr.Slider(0.2, 1, step=0.05, label="CFG / Pace", value=0.5)
+                        temp = gr.Slider(0.05, 5, step=0.05, label="Temperature", value=0.8)
+                        chunk_len = gr.Slider(500, 800, step=50, label="Chunk Length", value=750)
+                        seed_num = gr.Number(value=0, label="Seed (0 = random)")
 
-            error_display = gr.Markdown(visible=False)
-            run_btn = gr.Button("Generate Speech", variant="primary")
+                    error_display = gr.Markdown(visible=False)
+                    run_btn = gr.Button("Generate Speech", variant="primary")
 
-        with gr.Column():
-            audio_output = gr.Audio(
-                label="Output Audio",
-                type="numpy",
-                interactive=False,
-                autoplay=False,
-                show_download_button=True
-            )
+                with gr.Column():
+                    audio_output = gr.Audio(
+                        label="Output Audio",
+                        type="numpy",
+                        interactive=False,
+                        autoplay=False,
+                        show_download_button=True
+                    )
 
-            gr.Markdown("""
-            ### 📋 Model Summary
-            **Current Constraints:**
-            - **ROPE Scaling**: 8,192 positional tokens  
-            - **Embeddings**: Text (2,048), Speech (4,096)  
-            - **Vocab**: 704 compact tokens
-            - **Chunking**: Adaptive 500–800 characters with silence padding  
-            - **Performance**: Optimized for CUDA / MPS with FP16 support  
-            - **License**: MIT License – Enhanced by [Usama Arshad](https://github.com/usamaraajput)
-            """)
+                    gr.Markdown("""
+                    ### 📋 Model Summary
+                    **Current Constraints:**
+                    - **ROPE Scaling**: 8,192 positional tokens
+                    - **Embeddings**: Text (2,048), Speech (4,096)
+                    - **Vocab**: 704 compact tokens
+                    - **Chunking**: Adaptive 500–800 characters with silence padding
+                    - **Performance**: Optimized for CUDA / MPS with FP16 support
+                    - **License**: MIT License – Enhanced by [Usama Arshad](https://github.com/usamaraajput)
+                    """)
+
+        with gr.TabItem("Prepare Voice"):
+            with gr.Row():
+                with gr.Column():
+                    voice_name_input = gr.Textbox(label="Voice Name", placeholder="Enter a name for the new voice")
+                    audio_file_input = gr.File(label="Reference Audio", file_types=["audio"])
+                    prepare_voice_btn = gr.Button("Prepare Voice", variant="primary")
+                with gr.Column():
+                    prepare_voice_output = gr.Textbox(label="Status")
 
     gr.Markdown("""
     <div style='position: fixed; bottom: 10px; left: 0; width: 100%; text-align: center; font-size: 0.85em; color: #666; z-index: 999; '>
@@ -245,6 +300,12 @@ with gr.Blocks(
         fn=generate_audio,
         inputs=[text, ref_avatar, exaggeration, cfg_weight, temp, chunk_len, seed_num],
         outputs=[audio_output],
+    )
+
+    prepare_voice_btn.click(
+        fn=prepare_voice,
+        inputs=[voice_name_input, audio_file_input],
+        outputs=[prepare_voice_output, ref_avatar],
     )
 
 demo.queue(max_size=5)
